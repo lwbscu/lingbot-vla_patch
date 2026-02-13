@@ -276,10 +276,11 @@ def prepare_language(config, language_tokenizer, observation: dict[str, Tensor])
     if prompt is not None and (lang_tokens is None or lang_masks is None):
         prompt = [p if p.startswith("<bos>") else f"<bos>{p}" for p in prompt]
         prompt = [p if p.endswith("\n") else f"{p}\n" for p in prompt]
+        # [严谨修复] 严格遵守 Hugging Face API 契约，将 padding_side 作为属性赋值
+        language_tokenizer.padding_side = "right"
         tokenized_prompt = language_tokenizer.__call__(
             prompt,
             padding="max_length",
-            padding_side="right",
             max_length=config.tokenizer_max_length,
             truncation=True,
             return_tensors="pt",

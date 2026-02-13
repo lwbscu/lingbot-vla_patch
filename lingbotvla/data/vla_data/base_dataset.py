@@ -160,17 +160,36 @@ class RobotwinDataset(Dataset):
 
     def getdata(self, idx):
         item = self.dataset[idx]
-        task = self.dataset_meta.tasks[int(item['task_index'])]
+        
+        # 1. [严谨修复] 兼容 v3.0 的 DataFrame Task 获取方式
+        if hasattr(self.dataset_meta.tasks, "iloc"):
+            task = self.dataset_meta.tasks.iloc[int(item['task_index'])].name
+        else:
+            task = self.dataset_meta.tasks[int(item['task_index'])]
         assert task == item['task']
 
         normalized_item = self.normalizer.normalize(item)
-        base_image = (normalized_item["observation.images.cam_high"] * 255).to(torch.uint8)
-        left_wrist_image = (normalized_item["observation.images.cam_left_wrist"] * 255).to(
-            torch.uint8
-        )
-        right_wrist_image = (normalized_item["observation.images.cam_right_wrist"] * 255).to(
-            torch.uint8
-        )
+        
+        # 2. [不妥协的物理对齐] 你的 Piper 只有 head_camera，LingBot 默认需要 3 个视角
+        # 获取主视角 (兼容 head_camera 或 cam_high)
+        if "observation.images.head_camera" in normalized_item:
+            base_image = (normalized_item["observation.images.head_camera"] * 255).to(torch.uint8)
+        elif "observation.images.cam_high" in normalized_item:
+            base_image = (normalized_item["observation.images.cam_high"] * 255).to(torch.uint8)
+        else:
+            raise KeyError("Neither head_camera nor cam_high found in dataset.")
+
+        # 严谨处理丢失的腕部相机：创建与 base_image shape 一致的全零张量，绝不随便复制主视野骗模型
+        if "observation.images.cam_left_wrist" in normalized_item:
+            left_wrist_image = (normalized_item["observation.images.cam_left_wrist"] * 255).to(torch.uint8)
+        else:
+            left_wrist_image = torch.zeros_like(base_image)
+
+        if "observation.images.cam_right_wrist" in normalized_item:
+            right_wrist_image = (normalized_item["observation.images.cam_right_wrist"] * 255).to(torch.uint8)
+        else:
+            right_wrist_image = torch.zeros_like(base_image)
+
         batch_dict =  {
             "image": {"base_0_rgb": base_image, "left_wrist_0_rgb": left_wrist_image, "right_wrist_0_rgb": right_wrist_image},
             "state": normalized_item["observation.state"].to(torch.float32),
@@ -178,9 +197,10 @@ class RobotwinDataset(Dataset):
             "action_is_pad": normalized_item["action_is_pad"],
             "prompt": [item["task"]],
         }
-        state = prepare_state(self.config, batch_dict) # bs,8 -> bs,32
-        lang_tokens, lang_masks = prepare_language(self.config, self.tokenizer, batch_dict) # bs, seq_len
-        actions = prepare_action(self.config, batch_dict) # bs,50,7 -> bs,50,32 , 7
+        
+        state = prepare_state(self.config, batch_dict) 
+        lang_tokens, lang_masks = prepare_language(self.config, self.tokenizer, batch_dict) 
+        actions = prepare_action(self.config, batch_dict) 
         images, img_masks, pil_images = prepare_images(self.config, self.image_processor, batch_dict, use_depth_align=self.use_depth_align)
 
         batch_dict = {

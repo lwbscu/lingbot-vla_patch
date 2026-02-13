@@ -1,46 +1,96 @@
 import torch
-from torch import nn
-import torch.nn.functional as F
-from torch.nn import CrossEntropyLoss
-from torch import Tensor, nn
-from typing import List, Optional, Tuple, Union, Callable, Dict, Any
 import math
-from transformers import (
-    PreTrainedModel,
-)
+import torch.nn.functional as F
+from torch import nn, Tensor
+from torch.nn import CrossEntropyLoss
+from typing import List, Optional, Tuple, Union, Callable, Dict, Any
 from dataclasses import dataclass
-from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import Qwen2_5_VLConfig, Qwen2_5_VLVisionConfig
-from transformers.cache_utils import Cache, SlidingWindowCache, StaticCache, DynamicCache
-from transformers.generation import GenerationMixin
-from transformers.modeling_outputs import (
-    BaseModelOutputWithPast,
-)
-from transformers.modeling_utils import PreTrainedModel
+
+# 1. 核心：强制解决 Unpack 缺失问题
+try:
+    from typing import Unpack
+except ImportError:
+    try:
+        from typing_extensions import Unpack
+    except ImportError:
+        class Unpack:
+            def __getitem__(self, item): return item
+        Unpack = Unpack()
+
+# 2. Transformers 基础导入
+from transformers import PreTrainedModel, GenerationMixin
+from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.utils import (
-    ModelOutput,
-    add_start_docstrings,
-    add_start_docstrings_to_model_forward,
-    logging,
-    replace_return_docstrings,
+    ModelOutput, add_start_docstrings, add_start_docstrings_to_model_forward, logging, replace_return_docstrings
 )
 from transformers.activations import ACT2FN
 from transformers.modeling_attn_mask_utils import AttentionMaskConverter
-from transformers.modeling_flash_attention_utils import FlashAttentionKwargs, flash_attn_supports_top_left_mask, is_flash_attn_available
-from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from transformers.processing_utils import Unpack
-import torch.distributed._tensor as dt
+from transformers.cache_utils import Cache, StaticCache, DynamicCache
 
-if is_flash_attn_available():
-    from transformers.modeling_flash_attention_utils import apply_rotary_emb, flash_attn_varlen_func
-if is_flash_attn_available():
-    from transformers.modeling_flash_attention_utils import _flash_attention_forward
+# 3. 导入本地配置类
+from .configuration_qwen2_5_vl import Qwen2_5_VLConfig, Qwen2_5_VLVisionConfig
 
+# 4. 强制物理定义兼容层
+try:
+    from transformers.cache_utils import SlidingWindowCache
+except ImportError:
+    class SlidingWindowCache: pass
+
+try:
+    from transformers.modeling_flash_attention_utils import FlashAttentionKwargs, is_flash_attn_available
+except ImportError:
+    try:
+        from transformers.modeling_utils import is_flash_attn_available
+    except ImportError:
+        def is_flash_attn_available(): return False
+    class FlashAttentionKwargs:
+        def __init__(self, *args, **kwargs): pass
+
+# 5. 核心：物理注入 ROPE 字典和装饰器 (解决 KeyError: 'mrope' 和 'default')
+global_rope_funcs = {}
+try:
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+    global_rope_funcs = ROPE_INIT_FUNCTIONS
+except ImportError:
+    try:
+        from transformers.models.qwen2.modeling_qwen2 import ROPE_INIT_FUNCTIONS
+        global_rope_funcs = ROPE_INIT_FUNCTIONS
+    except ImportError:
+        pass
+
+def generic_rope_init_patch(config, device):
+    head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+    base = getattr(config, "rope_theta", getattr(config, "rope_base", 1000000.0))
+    inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float().to(device) / head_dim))
+    return inv_freq, 1.0
+
+global_rope_funcs["mrope"] = generic_rope_init_patch
+global_rope_funcs["default"] = generic_rope_init_patch
+ROPE_INIT_FUNCTIONS = global_rope_funcs
+
+def dynamic_rope_update(func): return func
+
+# 6. Flash Attention 内部转发补丁 (bf16 推理必需)
+if is_flash_attn_available():
+    try:
+        from transformers.modeling_flash_attention_utils import apply_rotary_emb, flash_attn_varlen_func, _flash_attention_forward
+    except ImportError:
+        pass
 
 logger = logging.get_logger(__name__)
+# ======================================================================
 
 _CONFIG_FOR_DOC = "Qwen2_5_VLConfig"
+# === RLinf PRO Fix: 补齐 RoPE 核心算子 rotate_half ===
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
 
-
+# 同时物理检查 apply_multimodal_rotary_pos_emb 是否也依赖它 (通常是依赖的)
+# 只要上面定义了，全文件的 NameError 都会消失。
+# ==================================================
 class Qwen2_5_VLMLP(nn.Module):
     def __init__(self, config, bias: bool = False):
         super().__init__()
@@ -248,6 +298,7 @@ def apply_rotary_pos_emb_vision(
 
 QWEN2_5_VL_VISION_ATTENTION_CLASSES = {
     "eager": Qwen2_5_VLVisionAttention,
+    "sdpa": Qwen2_5_VLVisionAttention,
     "flash_attention_2": Qwen2_5_VLVisionFlashAttention2,
 }
 
@@ -796,6 +847,7 @@ class Qwen2MLP(nn.Module):
 
 QWEN2_5_VL_ATTENTION_CLASSES = {
     "eager": Qwen2_5_VLAttention,
+    "sdpa": Qwen2_5_VLAttention,
     "flash_attention_2": Qwen2_5_VLFlashAttention2,
 }
 
@@ -1307,7 +1359,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
 
     def __init__(self, config):
         super().__init__(config)
-        self.visual = Qwen2_5_VisionTransformerPretrainedModel._from_config(config.vision_config, use_flash_attention_2=True)
+        self.visual = Qwen2_5_VisionTransformerPretrainedModel._from_config(config.vision_config, use_flash_attention_2=False)
         self.model = Qwen2_5_VLModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)

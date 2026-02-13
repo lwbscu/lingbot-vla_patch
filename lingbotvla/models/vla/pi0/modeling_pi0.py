@@ -4,8 +4,8 @@ import numpy as np
 import torch
 from torch import nn
 import torch.nn.functional as F
-from lerobot.common.policies.pi0.configuration_pi0 import PI0Config
-from lerobot.common.policies.pretrained import PreTrainedPolicy
+from lerobot.policies.pi0.configuration_pi0 import PI0Config
+from lerobot.policies.pretrained import PreTrainedPolicy
 from torch import Tensor, nn
 from typing import List, Optional, Tuple, Union
 from transformers import (
@@ -59,7 +59,6 @@ from .utils import (
 )
 from .utils import apply_rope, our_eager_attention_forward
 from .flex_attention import flex_attention_forward
-import ipdb
 IMAGE_KEYS = (
     "base_0_rgb",
     "left_wrist_0_rgb",

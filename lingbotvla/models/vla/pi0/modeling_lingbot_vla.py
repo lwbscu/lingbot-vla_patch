@@ -1,48 +1,95 @@
 import einops
 import torch
-from torch import nn
 import torch.nn.functional as F
+from torch import nn, Tensor
 from torch.nn import CrossEntropyLoss
-from lerobot.common.policies.pi0.configuration_pi0 import PI0Config
-from lerobot.common.policies.pretrained import PreTrainedPolicy
-from torch import Tensor, nn
 from typing import List, Optional, Tuple, Union, Callable, Dict, Any
 from functools import partial
+from dataclasses import dataclass
+from dataclasses import dataclass, field
+import torch.distributed._tensor as dt
+
+# RLinf Environment Contract & LeRobot
+from lerobot.policies.pi0.configuration_pi0 import PI0Config
+from lerobot.policies.pretrained import PreTrainedPolicy
+
+# Transformers Base
 from transformers import (
     AutoConfig,
     PretrainedConfig,
     PreTrainedModel,
+    AutoTokenizer,
 )
 from transformers.models.auto import CONFIG_MAPPING
-from transformers import AutoTokenizer
-from dataclasses import dataclass
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
-from transformers.cache_utils import Cache, SlidingWindowCache, StaticCache, DynamicCache
 from transformers.generation import GenerationMixin
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
 )
-from transformers.modeling_utils import PreTrainedModel, ALL_ATTENTION_FUNCTIONS
-from transformers.utils import (
-    ModelOutput,
-    add_start_docstrings,
-    add_start_docstrings_to_model_forward,
-    logging,
-    replace_return_docstrings,
-    LossKwargs,
-    can_return_tuple,
-    is_torch_flex_attn_available,
-)
-from transformers.utils.deprecation import deprecate_kwarg
 from transformers.activations import ACT2FN
 from transformers.modeling_attn_mask_utils import AttentionMaskConverter
-from transformers.modeling_flash_attention_utils import FlashAttentionKwargs, is_flash_attn_available
-from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from transformers.processing_utils import Unpack
-import torch.distributed._tensor as dt
-from .qwenvl_in_vla import Qwen2_5_VLForConditionalGeneration, Qwen2_5_VLModel, Qwen2_5_VLPreTrainedModel
 
+# 核心：显式导入缺失的文档字符串工具
+from transformers.utils import (
+    add_start_docstrings,
+    add_start_docstrings_to_model_forward,
+    replace_return_docstrings,
+    logging,
+)
+# === RLinf Compatibility Layer (Fixed for Transformers 4.40.1) ===
+from transformers.cache_utils import Cache, StaticCache, DynamicCache
+try:
+    from transformers.cache_utils import SlidingWindowCache
+except ImportError:
+    class SlidingWindowCache: pass
+
+try:
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+except ImportError:
+    # 4.40.1 fallback constants
+    ALL_ATTENTION_FUNCTIONS = {'eager': None, 'flash_attention_2': None, 'sdpa': None}
+
+from transformers import utils as transformers_utils
+try:
+    from transformers.utils import LossKwargs, can_return_tuple, is_torch_flex_attn_available
+except ImportError:
+    @dataclass
+    class LossKwargs: pass
+    def can_return_tuple(func): return func
+    def is_torch_flex_attn_available(): return False
+
+try:
+    from transformers.utils.deprecation import deprecate_kwarg
+except ImportError:
+    def deprecate_kwarg(*args, **kwargs):
+        def _decorator(func): return func
+        return _decorator
+
+try:
+    from transformers.modeling_flash_attention_utils import FlashAttentionKwargs, is_flash_attn_available
+except ImportError:
+    try:
+        from transformers.modeling_utils import is_flash_attn_available
+    except ImportError:
+        def is_flash_attn_available(): return False
+    class FlashAttentionKwargs:
+        def __init__(self, *args, **kwargs): pass
+
+# === RLinf Fix: 强制使用 qwenvl 中物理注入了 'default' 和 'mrope' 的字典 ===
+from .qwenvl_in_vla import ROPE_INIT_FUNCTIONS, dynamic_rope_update
+try:
+    from typing import Unpack
+except ImportError:
+    try:
+        from typing_extensions import Unpack
+    except ImportError:
+        class Unpack: pass
+# ==============================================================
+
+from .qwenvl_in_vla import Qwen2_5_VLForConditionalGeneration, Qwen2_5_VLModel, Qwen2_5_VLPreTrainedModel
+# === RLinf Fix: 显式导入本地配置类 ===
+from .configuration_qwen2_5_vl import Qwen2_5_VLConfig
 try:
     from dinov3.hub.backbones import (
         dinov3_vits16,
@@ -50,23 +97,24 @@ try:
         dinov3_vitb16,
     )
 except: pass
+
 from .utils import (
     create_sinusoidal_pos_embedding,
     make_att_2d_masks,
     resize_with_pad,
     sample_beta,
+    apply_rope, 
+    our_eager_attention_forward
 )
-from .utils import apply_rope, our_eager_attention_forward
 from .flex_attention import flex_attention_forward
 
+from transformers.utils import logging
 logger = logging.get_logger(__name__)
 
 _CHECKPOINT_FOR_DOC = "meta-qwen2/Qwen2-2-7b-hf"
 _CONFIG_FOR_DOC = "Qwen2Config"
 
-
 from lingbotvla.models.vla.vision_models.align_heads.depth_head import DepthHead, TaskTokenDepthHead
-
 
 class Qwen2MLP(nn.Module):
     def __init__(self, config):
@@ -943,7 +991,8 @@ class QwenvlWithExpertConfig(PretrainedConfig):
         self.vocab_size = vocab_size
         self.use_lm_head = use_lm_head
         if qwenvl_config is None:
-            self.qwenvl_config = CONFIG_MAPPING["qwen2_5_vl"](
+            # 直接使用本地定义的 Qwen2_5_VLConfig
+            self.qwenvl_config = Qwen2_5_VLConfig(
                 attention_dropout=0.0,
                 bos_token_id=151643,
                 eos_token_id=151645,
@@ -976,7 +1025,7 @@ class QwenvlWithExpertConfig(PretrainedConfig):
                     "hidden_size": 1280,
                     "intermediate_size": 3420,
                     "num_heads": 16,
-                    "in_chans": 3,
+                    "in_channels": 3,
                     "out_hidden_size": 2048,
                     "patch_size": 14,
                     "spatial_merge_size": 2,
@@ -1005,11 +1054,11 @@ class QwenvlWithExpertConfig(PretrainedConfig):
             if "model_type" not in qwen_expert_config:
                 qwenvl_config["model_type"] = "qwen2_5_vl"
 
-            cfg_cls = CONFIG_MAPPING[qwenvl_config["model_type"]]
+            cfg_cls = Qwen2_5_VLConfig
             self.qwenvl_config = cfg_cls(**qwenvl_config)
 
         if qwen_expert_config is None:
-            self.qwen_expert_config = CONFIG_MAPPING["qwen2"](
+            self.qwen_expert_config = Qwen2Config(
                 attention_dropout=0.0,
                 bos_token_id=151643,
                 eos_token_id=151645,
@@ -1038,7 +1087,7 @@ class QwenvlWithExpertConfig(PretrainedConfig):
             if "model_type" not in qwen_expert_config:
                 qwen_expert_config["model_type"] = "qwen2"
 
-            cfg_cls = CONFIG_MAPPING[qwenvl_config["model_type"]]
+            cfg_cls = Qwen2Config
             self.qwen_expert_config = cfg_cls(**qwen_expert_config)
 
         super().__init__(**kwargs)
@@ -1237,16 +1286,16 @@ class QwenvlWithExpertModel(PreTrainedModel):
     def __init__(self, config: QwenvlWithExpertConfig):
         super().__init__(config=config)
         self.config = config
-        vlm_config = AutoConfig.from_pretrained(self.config.tokenizer_path)
+        vlm_config = Qwen2_5_VLConfig.from_pretrained(self.config.tokenizer_path)
         vlm_config.vision_config.initializer_range = 0.02
         vlm_config.norm_qkv = self.config.norm_qkv
         if self.config.vocab_size != 0 and self.config.vocab_size != 257152 and vlm_config.vocab_size != self.config.vocab_size:
             vlm_config.vocab_size = self.config.vocab_size
-        self.qwenvl = Qwen2_5_VLForConditionalGeneration._from_config(vlm_config, use_flash_attention_2=True)
+        self.qwenvl = Qwen2_5_VLForConditionalGeneration._from_config(vlm_config, use_flash_attention_2=False)
         if self.config.use_lm_head:
             self.qwenvl.tie_weights()
         self.config.qwen_expert_config.norm_qkv = self.config.norm_qkv
-        self.qwen_expert = Qwen2ForCausalLM._from_config(self.config.qwen_expert_config, use_flash_attention_2=True)
+        self.qwen_expert = Qwen2ForCausalLM._from_config(self.config.qwen_expert_config, use_flash_attention_2=False)
 
         if getattr(self.config, 'adanorm_time', False):
             replace_lnorm_with_adanorm(self.qwen_expert, self.config.qwen_expert_config.hidden_size, self.config.qwen_expert_config.hidden_size, config.split_gate_liner, config.no_split_gate_liner, config.final_norm_adanorm, config.old_adanorm)
@@ -1254,7 +1303,13 @@ class QwenvlWithExpertModel(PreTrainedModel):
         del self.qwen_expert.model.embed_tokens
         if self.config.enable_expert_vision:
             if 'dinov3_vitb16' in self.config.expert_vision_type:
-                self.expert_visual = dinov3_vitb16(pretrained=False)
+                if self.config.enable_expert_vision:
+                    # 只有当导入成功的函数确实存在时才调用
+                    if 'dinov3_vitb16' in globals() or 'dinov3_vitb16' in locals():
+                        self.expert_visual = dinov3_vitb16(pretrained=False)
+                    else:
+                        print("⚠️ Warning: dinov3_vitb16 not found, disabling expert vision.")
+                        self.config.enable_expert_vision = False
             self.expert_visual_mlp = nn.Sequential(
                                         nn.Linear(self.expert_visual.embed_dim, self.expert_visual.embed_dim * 2),
                                         nn.GELU(),
@@ -1496,7 +1551,30 @@ class QwenvlWithExpertModel(PreTrainedModel):
 class QwenVLA_Config(PI0Config):
     model_type = "torch_qwenvla"
     architectures = ["LingbotVlaPolicy"]
-
+    
+    # 基础属性
+    attention_implementation: str = "eager"
+    freeze_vision_encoder: bool = True
+    train_expert_only: bool = True
+    tokenizer_path: str = ""
+    vocab_size: int = 0
+    use_lm_head: bool = False
+    
+    # 动作专家属性
+    train_state_proj: bool = True
+    max_state_dim: int = 75
+    max_action_dim: int = 75
+    n_action_steps: int = 50
+    num_steps: int = 10
+    proj_width: int = 1024
+    loss_type: str = "fm"
+    
+    # 视觉专家
+    enable_expert_vision: bool = False
+    expert_vision_type: str = "dinov3_vitb16"
+    
+    # 使用简单的 None 避开 field 依赖
+    align_params: dict = None
 class LingbotVlaPolicy(PreTrainedPolicy):
     config_class = QwenVLA_Config
     name = "torch_lingbot_vla"
@@ -1514,6 +1592,7 @@ class LingbotVlaPolicy(PreTrainedPolicy):
 
         super().__init__(config)
         self.config = config
+        self.config.tokenizer_path = tokenizer_path
         self.language_tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
         self.model = FlowMatching(config)
 
@@ -1535,7 +1614,9 @@ class LingbotVlaPolicy(PreTrainedPolicy):
         self, observation: dict[str, Tensor], noise: Tensor | None = None
     ):
         pass
-    
+    def predict_action_chunk(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        """映射 LeRobot 新版抽象方法到现有预测逻辑"""
+        return self.select_action(batch)    
     def forward(
         self, images, img_masks, state, lang_tokens, lang_masks, actions, joint_mask=None, action_is_pad=None, expert_imgs=None, label=None, noise=None, time=None, vlm_causal=False, use_ki=False, depth_targets=None, norm_qkv=False
     ) -> tuple[Tensor, dict[str, Tensor]]:
@@ -1567,14 +1648,14 @@ class FlowMatching(nn.Module):
 
         # qwenvl with action expert
         qwenvl_with_export_config = QwenvlWithExpertConfig(
-            freeze_vision_encoder=self.config.freeze_vision_encoder,
-            train_expert_only=self.config.train_expert_only,
-            vocab_size=getattr(self.config,"vocab_size", 0),
-            use_lm_head=getattr(self.config,"use_lm_head", False),
-            attention_implementation=self.config.attention_implementation,
-            tokenizer_path=self.config.tokenizer_path,
-            enable_expert_vision=self.config.enable_expert_vision,
-            expert_vision_type=self.config.expert_vision_type,
+            freeze_vision_encoder=getattr(self.config, "freeze_vision_encoder", True),
+            train_expert_only=getattr(self.config, "train_expert_only", True),
+            vocab_size=getattr(self.config, "vocab_size", 0),
+            use_lm_head=getattr(self.config, "use_lm_head", False),
+            attention_implementation=getattr(self.config, "attention_implementation", "eager"),
+            tokenizer_path=getattr(self.config, "tokenizer_path", ""),
+            enable_expert_vision=getattr(self.config, "enable_expert_vision", False),
+            expert_vision_type=getattr(self.config, "expert_vision_type", "dinov3_vitb16"),
         )
         qwenvl_with_export_config.adanorm_time = getattr(config, "adanorm_time", False)
         qwenvl_with_export_config.split_gate_liner = getattr(config, "split_gate_liner", False)
@@ -1617,6 +1698,11 @@ class FlowMatching(nn.Module):
         self.set_requires_grad()
     
     def init_depth_heads(self, config):
+        # [RLinf Fix] 确保即使 config 是对象也能读取，或者将其转为字典
+        if not isinstance(config, dict):
+            # 如果是 OmegaConf 对象，转为原生字典
+            from omegaconf import OmegaConf
+            config = OmegaConf.to_container(config, resolve=True)
         self.llm_image_token_size = config['llm']['image_token_size']
         self.llm_image_input_size = config['llm']['image_input_size']
         self.depth_token_size = config['depth']['token_size']
@@ -1660,8 +1746,10 @@ class FlowMatching(nn.Module):
                 module.weight.data[module.padding_idx].zero_()
 
     def set_requires_grad(self):
+        # [RLinf Fix] 防御性读取，防止基类属性缺失
+        train_state_proj = getattr(self.config, "train_state_proj", True)
         for params in self.state_proj.parameters():
-            params.requires_grad = self.config.train_state_proj
+            params.requires_grad = train_state_proj
 
     def sample_time(self, bsize, device):
         time_beta = sample_beta(1.5, 1.0, bsize, device)

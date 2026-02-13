@@ -21,8 +21,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Dict, Generator, List, Literal, Optional, Sequence, Tuple, Union
 
 import torch
-from diffusers.utils import SAFE_WEIGHTS_INDEX_NAME as DIFFUSERS_SAFE_WEIGHTS_INDEX_NAME
-from diffusers.utils import SAFETENSORS_WEIGHTS_NAME as DIFFUSERS_SAFETENSORS_WEIGHTS_NAME
+DIFFUSERS_SAFE_WEIGHTS_INDEX_NAME = "diffusion_pytorch_model.safetensors.index.json"
+DIFFUSERS_SAFETENSORS_WEIGHTS_NAME = "diffusion_pytorch_model.safetensors"
 from torch import distributed as dist
 from torch import nn
 from tqdm import tqdm

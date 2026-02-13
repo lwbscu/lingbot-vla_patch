@@ -7,7 +7,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from packaging.version import Version
-import ipdb
 # from xformers.ops import memory_efficient_attention
 
 
@@ -123,85 +122,48 @@ def our_eager_attention_forward(
     value_states: torch.Tensor,
     attention_mask: torch.Tensor,
 ):
-    """
-    Performs eager attention, optimized with torch.einsum.
+    """标准的 Eager Attention 实现"""
+    bsz, q_len, num_heads, head_dim = query_states.shape
+    
+    # 重塑维度进行矩阵乘法 [batch, heads, seq, dim]
+    query_states = query_states.transpose(1, 2)
+    key_states = key_states.transpose(1, 2)
+    value_states = value_states.transpose(1, 2)
 
-    Args:
-        query_states: Query tensor of shape [batch_size, seq_len, num_attention_heads, head_dim].
-        key_states: Key tensor of shape [batch_size, seq_len, num_key_value_heads, head_dim].
-        value_states: Value tensor of shape [batch_size, seq_len, num_key_value_heads, head_dim].
-        attention_mask: Attention mask tensor, typically [batch_size, 1, seq_len, seq_len] or [batch_size, seq_len, seq_len].
+    attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(head_dim)
 
-    Returns:
-        Output tensor of shape [batch_size, seq_len, num_attention_heads * head_dim].
-    """
-    # ipdb.set_trace()
-    bsize, seq_len, num_att_heads, head_dim = query_states.shape
-    num_key_value_heads = key_states.shape[2]
-    num_key_value_groups = num_att_heads // num_key_value_heads
+    if attention_mask is not None:
+        attn_weights = attn_weights + attention_mask
 
-    key_states = einops.repeat(
-        key_states, "b l h d -> b l (h g) d", g=num_key_value_groups
-    )
-    value_states = einops.repeat(
-        value_states, "b l h d -> b l (h g) d", g=num_key_value_groups
-    )
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+    attn_output = torch.matmul(attn_weights, value_states)
 
-    query_states_permuted = torch.einsum("blhd->bhld", query_states)
-    key_states_permuted = torch.einsum("blhd->bhld", key_states)
-
-    att_weights = torch.einsum(
-        "bhqd,bhkd->bhqk", query_states_permuted, key_states_permuted
-    )
-    att_weights *= head_dim**-0.5
-
-    big_neg = -2.3819763e38
-    masked_att_weights = torch.where(
-        attention_mask[:, None, :, :], att_weights, big_neg
-    )
-
-    probs = nn.functional.softmax(masked_att_weights, dim=-1)
-    probs = probs.to(dtype=value_states.dtype)
-
-    value_states_permuted = torch.einsum("blhd->bhld", value_states)  # [B, H, L_v, D]
-    att_output = torch.einsum(
-        "bhqk,bhkv->bhqv", probs, value_states_permuted
-    )  # [B, H, L_q, D]
-    att_output = torch.einsum("bhld->blhd", att_output)  # [B, L, H, D]
-    att_output = att_output.reshape(bsize, seq_len, num_att_heads * head_dim)
-
-    return att_output
-
-
-# @torch.jit.script
-def apply_rope(
-    x: torch.Tensor,
-    positions: torch.Tensor,
-    max_wavelength: float = 10_000.0,
-    dtype: torch.dtype = torch.float32,
-) -> torch.Tensor:
-    """Applies RoPE positions [B, L] to x [B, L, H, D]."""
-    # ipdb.set_trace()
-    original_dtype = x.dtype # bf16
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    return attn_output.reshape(bsz, q_len, -1)  
+def apply_rope(x, positions, max_wavelength=10000, dtype=torch.float32):
+    """旋转位置编码 (RoPE) 的物理实现"""
+    original_dtype = x.dtype
     d = x.shape[-1]
     d_half = d // 2
     device = x.device
 
-    # Cast input to compute_dtype for all internal operations
+    # 转为指定精度计算
     x_casted = x.to(dtype)
     positions_casted = positions.to(dtype)
 
     freq_exponents = (2.0 / d) * torch.arange(d_half, dtype=dtype, device=device)
     timescale = max_wavelength**freq_exponents
-    radians = torch.einsum("bl,h->blh", positions_casted, 1.0 / timescale) # fp32 -> bf16
-
+    
+    # 计算旋转弧度
+    radians = torch.einsum("bl,h->blh", positions_casted, 1.0 / timescale)
     radians = radians[..., None, :]  # [B, L, 1, D_half]
 
-    sin = torch.sin(radians) # bf16
-    cos = torch.cos(radians) # bf16
+    sin = torch.sin(radians)
+    cos = torch.cos(radians)
 
-    x1, x2 = x_casted.split(d_half, dim=-1) # fp32
+    x1, x2 = x_casted.split(d_half, dim=-1)
+    
+    # 旋转变换：[x1*cos - x2*sin, x2*cos + x1*sin]
+    res = torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
 
-    res = torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1) # fp32
-
-    return res.to(original_dtype) # bf16
+    return res.to(original_dtype)

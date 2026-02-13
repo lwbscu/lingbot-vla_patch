@@ -1621,8 +1621,10 @@ class LingbotVlaPolicy(PreTrainedPolicy):
         self, images, img_masks, state, lang_tokens, lang_masks, actions, joint_mask=None, action_is_pad=None, expert_imgs=None, label=None, noise=None, time=None, vlm_causal=False, use_ki=False, depth_targets=None, norm_qkv=False
     ) -> tuple[Tensor, dict[str, Tensor]]:
         loss_dict = {}
+        # [严谨修复] 兼容 PI0Config，安全提取 loss_type，缺省对齐底层默认的 Flow Matching ('fm')
+        current_loss_type = getattr(self.config, "loss_type", "fm")
         losses, loss_depth, depth_preds = self.model.forward(
-            images, img_masks, lang_tokens, lang_masks, state, actions, expert_imgs, label, noise, time, vlm_causal, self.config.loss_type, use_ki, depth_targets, norm_qkv
+            images, img_masks, lang_tokens, lang_masks, state, actions, expert_imgs, label, noise, time, vlm_causal, current_loss_type, use_ki, depth_targets, norm_qkv
         )
         batch_mean_losses = losses.mean(dim=(1, 2))
 

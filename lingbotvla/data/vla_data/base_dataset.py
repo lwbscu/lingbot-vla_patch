@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
+import torch.nn.functional as F
 import os
 from typing import Callable, Dict, List, Literal, Optional
 import numpy as np
@@ -161,7 +161,7 @@ class RobotwinDataset(Dataset):
     def getdata(self, idx):
         item = self.dataset[idx]
         
-        # 1. [严谨修复] 兼容 v3.0 的 DataFrame Task 获取方式
+        # 1. 兼容 v3.0 的 Task 获取（保持不变）
         if hasattr(self.dataset_meta.tasks, "iloc"):
             task = self.dataset_meta.tasks.iloc[int(item['task_index'])].name
         else:
@@ -170,28 +170,26 @@ class RobotwinDataset(Dataset):
 
         normalized_item = self.normalizer.normalize(item)
         
-        # 2. [不妥协的物理对齐] 你的 Piper 只有 head_camera，LingBot 默认需要 3 个视角
-        # 获取主视角 (兼容 head_camera 或 cam_high)
-        if "observation.images.head_camera" in normalized_item:
-            base_image = (normalized_item["observation.images.head_camera"] * 255).to(torch.uint8)
-        elif "observation.images.cam_high" in normalized_item:
-            base_image = (normalized_item["observation.images.cam_high"] * 255).to(torch.uint8)
-        else:
-            raise KeyError("Neither head_camera nor cam_high found in dataset.")
+        # 强制缩放至 224x224，这是对齐 Window Size 的黄金分辨率
+        cam_key = "observation.images.head_camera" if "observation.images.head_camera" in normalized_item else "observation.images.cam_high"
+        raw_image = (normalized_item[cam_key] * 255).to(torch.uint8)
+        
+        # 👑 [严谨] 显式转换 float 后插值，确保边缘对齐
+        base_image = F.interpolate(
+            raw_image.unsqueeze(0).float(), 
+            size=(224, 224), mode="bilinear", align_corners=False
+        ).squeeze(0).to(torch.uint8)
 
-        # 严谨处理丢失的腕部相机：创建与 base_image shape 一致的全零张量，绝不随便复制主视野骗模型
-        if "observation.images.cam_left_wrist" in normalized_item:
-            left_wrist_image = (normalized_item["observation.images.cam_left_wrist"] * 255).to(torch.uint8)
-        else:
-            left_wrist_image = torch.zeros_like(base_image)
+        # 视角复制
+        left_wrist_image = base_image.clone()
+        right_wrist_image = base_image.clone()
 
-        if "observation.images.cam_right_wrist" in normalized_item:
-            right_wrist_image = (normalized_item["observation.images.cam_right_wrist"] * 255).to(torch.uint8)
-        else:
-            right_wrist_image = torch.zeros_like(base_image)
-
-        batch_dict =  {
-            "image": {"base_0_rgb": base_image, "left_wrist_0_rgb": left_wrist_image, "right_wrist_0_rgb": right_wrist_image},
+        batch_dict = {
+            "image": {
+                "base_0_rgb": base_image, 
+                "left_wrist_0_rgb": left_wrist_image, 
+                "right_wrist_0_rgb": right_wrist_image
+            },
             "state": normalized_item["observation.state"].to(torch.float32),
             "action": normalized_item["action"].to(torch.float32),
             "action_is_pad": normalized_item["action_is_pad"],
